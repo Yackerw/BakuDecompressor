@@ -1,0 +1,5 @@
+src/.vs
+src/debug
+src/release
+src/BakuDecompressor/Debug
+src/BakuDecompressor/Release
