@@ -345,7 +345,7 @@ void main(int argc, char *argv[]) {
 		}
 	}
 	if (argc >= 5) {
-		if (strcmp(argv[3], "-o")) {
+		if (strcmp(argv[3], "-o") == 0) {
 			oname = argv[4];
 		}
 	}
