@@ -321,10 +321,6 @@ void DecompressFile1(file_t* file, unsigned char* out, int decompSize) {
 		if (file->remainingBytes <= 0) {
 			return;
 		}
-		if (i == 0x23) {
-			++i;
-			--i;
-		}
 		bool compressed = ExtractBytes(file, 1) == 1;
 		if (!compressed) {
 			// just get next byte and put it to out
@@ -463,10 +459,6 @@ void CompressFile(char* fname, char* oname) {
 				}
 			}
 		}
-		if (i >= 0x4054) {
-			++i;
-			--i;
-		}
 		// okay, great, we find anything?
 		if (bestCount >= minBytesCopy) {
 			// compressed
@@ -515,9 +507,6 @@ void main(int argc, char *argv[]) {
 		printf("Usage: BakuDecompressor [mode] [input] [output]\r\nAvailable modes are:\r\n-d: decompresses an input file to output file\r\n-c: compresses an input file to output file");
 		return;
 	}
-	unsigned int aa = 0xFF0000;
-	aa <<= 48;
-	printf("%i", aa);
 	fname = argv[2];
 	oname = argv[3];
 	if (mode == 0) {
