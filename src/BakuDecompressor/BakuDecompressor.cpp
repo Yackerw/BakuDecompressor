@@ -3,13 +3,15 @@
 #include <string.h>
 #include <malloc.h>
 
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
 struct file_t {
 	unsigned int prevData;
 	char* data;
 	int remainingBytes;
 	int remainingBits;
 };
-
 
 // this actually just functions as a bitstream basically...
 unsigned int ExtractBytes(file_t* file, int arg1) {
@@ -316,6 +318,13 @@ void DecompressFile(unsigned char* psuedoDecomp, file_t* file, unsigned char *ou
 void DecompressFile1(file_t* file, unsigned char* out, int decompSize) {
 	// this is much easier...
 	for (int i = 0; i < decompSize;) {
+		if (file->remainingBytes <= 0) {
+			return;
+		}
+		if (i == 0x23) {
+			++i;
+			--i;
+		}
 		bool compressed = ExtractBytes(file, 1) == 1;
 		if (!compressed) {
 			// just get next byte and put it to out
@@ -336,53 +345,220 @@ void DecompressFile1(file_t* file, unsigned char* out, int decompSize) {
 	}
 }
 
-void main(int argc, char *argv[]) {
-	char *fname = (char*)"input.cpwb";
-	char* oname = (char*)"output";
-	if (argc >= 3) {
-		if (strcmp(argv[1], "-i") == 0) {
-			fname = argv[2];
-		}
+const int maxBytesBack = 0xFFF;
+const int minBytesCopy = 3;
+const int maxBytesCopy = 0x12;
+
+void WriteLE32(FILE* f, unsigned int value) {
+	unsigned int tmp = _byteswap_ulong(value);
+	fwrite(&tmp, 4, 1, f);
+}
+
+struct BitWriter {
+	unsigned int currData;
+	FILE* f;
+	int currOffset;
+};
+
+void BitWriterWrite(BitWriter *bw, unsigned int value, int bitCount) {
+	/*int writeCount = MIN(bw->currOffset + bitCount, 32);
+	int shiftCount = writeCount - bw->currOffset;
+	bw->currData <<= shiftCount;
+	if (shiftCount != bitCount) {
+		// shift new value so it only holds what we want
+		int lsamnt = (bitCount - shiftCount);
+		int newValue = value >> lsamnt;
+		bw->currData |= newValue;
+		// filled up our current 32 bit buffer, write it
+		WriteLE32(bw->f, bw->currData);
+		// now only take remaining data from our value
+		bw->currData = (value << (31 - lsamnt)) >> (31 - lsamnt);
+		bw->currOffset = lsamnt;
 	}
-	if (argc >= 5) {
-		if (strcmp(argv[3], "-o") == 0) {
-			oname = argv[4];
-		}
+	else {
+		bw->currData |= value;
+		bw->currOffset += bitCount;
+	}*/
+	// keep oldest on the right...
+	int writeCount = MIN(bw->currOffset + bitCount, 32);
+	int shiftCount = writeCount - bw->currOffset;
+	// because apparently shifting by 0x20 does nothing?
+	if (bw->currOffset != 0x20) {
+		bw->currData |= value << bw->currOffset;
 	}
+	if (shiftCount != bitCount) {
+		// have to preserve remaining bits
+		int lsamnt = shiftCount;
+		unsigned int newValue = value >> lsamnt;
+		// write our current buffer
+		WriteLE32(bw->f, bw->currData);
+		// update our buffer
+		bw->currData = newValue;
+		bw->currOffset = bitCount - shiftCount;
+	}
+	else {
+		bw->currOffset += bitCount;
+	}
+}
+
+void CompressFile(char* fname, char* oname) {
+	// ensure we can actually open the file
 	FILE* f = fopen(fname, "rb");
-	fseek(f, 0x4, SEEK_SET);
-	unsigned int fileVer;
-	fread(&fileVer, 4, 1, f);
-	//fileVer = _byteswap_ulong(fileVer);
-	fseek(f, 0xC, SEEK_SET);
-	int decompSize;
-	fread(&decompSize, 4, 1, f);
-	decompSize = _byteswap_ulong(decompSize);
-	unsigned char* out = (unsigned char*)malloc(decompSize);
-	unsigned char* psuedoDecomp = (unsigned char*)malloc(1024 * 1024 * 2); // again, 2 megs because ??
-	file_t file;
+	if (f == NULL) {
+		printf("Failed to open input file %s!", fname);
+		return;
+	}
+	FILE* out = fopen(oname, "wb");
+	if (out == NULL) {
+		fclose(f);
+		printf("Failed to open output file %s!", oname);
+		return;
+	}
+	// write magic word first
+	WriteLE32(out, 0x43505742);
+	// indicator
+	WriteLE32(out, 0x01000000);
+	// unused
+	WriteLE32(out, 0);
+	// uncompressed file size
 	fseek(f, 0, SEEK_END);
-	int fsize = ftell(f);
-	fseek(f, 0x10, SEEK_SET);
-	file.data = (char*)malloc(fsize - 0x10);
-	fread(file.data, fsize - 0x10, 1, f);
+	int fileSize = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	WriteLE32(out, fileSize);
+	// set up our bitstream writer
+	BitWriter bw;
+	bw.f = out;
+	bw.currData = 0;
+	bw.currOffset = 0;
+	// read the data from our uncompressed file
+	unsigned char* uncompressed = (unsigned char*)malloc(fileSize);
+	fread(uncompressed, fileSize, 1, f);
 	fclose(f);
-	file.remainingBits = 0;
-	file.prevData = 0;
-	file.remainingBytes = fsize - 0x10;
-	char* origdata = file.data;
-	if (fileVer == 2) {
-		DecompressFile(psuedoDecomp, &file, out, decompSize);
+	for (int i = 0; i < fileSize;) {
+		unsigned char currByte = uncompressed[i];
+		int bestBack = 0;
+		int bestCount = 0;
+		for (int i2 = 1; i2 <= maxBytesBack; ++i2) {
+			// don't need invalid values...
+			if (i - i2 < 0) {
+				break;
+			}
+			int i3 = 0;
+			for (; i3 < maxBytesCopy; ++i3) {
+				// cancel if we're eof
+				if (i + i3 >= fileSize) {
+					break;
+				}
+				if (uncompressed[(i - i2) + i3] != uncompressed[i + i3]) {
+					break;
+				}
+			}
+			// have we found more?
+			if (i3 > bestCount) {
+				bestCount = i3;
+				bestBack = i2;
+				// we no longer need to check
+				if (i3 == maxBytesCopy) {
+					break;
+				}
+			}
+		}
+		if (i >= 0x4054) {
+			++i;
+			--i;
+		}
+		// okay, great, we find anything?
+		if (bestCount >= minBytesCopy) {
+			// compressed
+			BitWriterWrite(&bw, 1, 1);
+			// how many to copy
+			BitWriterWrite(&bw, bestCount - minBytesCopy, 0x4);
+			// how many to go back
+			BitWriterWrite(&bw, bestBack, 0xC);
+			// and increment our iterator
+			i += bestCount;
+		}
+		else {
+			// just copy the 1 byte
+			BitWriterWrite(&bw, 0, 1);
+			BitWriterWrite(&bw, currByte, 8);
+			++i;
+		}
 	}
-	else if (fileVer == 1) {
-		DecompressFile1(&file, out, decompSize);
+
+	// write any remaining data
+	if (bw.currOffset != 0) {
+		WriteLE32(out, bw.currData);
 	}
-	// write output file
-	f = fopen(oname, "wb");
-	fwrite(out, decompSize, 1, f);
-	// done, clean up
-	fclose(f);
-	free(origdata);
-	free(out);
-	free(psuedoDecomp);
+	// cleanup
+
+	fclose(out);
+
+	free(uncompressed);
+}
+
+void main(int argc, char *argv[]) {
+	char* fname;
+	char* oname;
+	int mode = 0;
+	if (argc < 4) {
+		printf("Usage: BakuDecompressor [mode] [input] [output]\r\nAvailable modes are:\r\n-d: decompresses an input file to output file\r\n-c: compresses an input file to output file");
+		return;
+	}
+	if (strcmp(argv[1], "-d") == 0) {
+		mode = 0;
+	}
+	else if (strcmp(argv[1], "-c") == 0) {
+		mode = 1;
+	}
+	else {
+		printf("Usage: BakuDecompressor [mode] [input] [output]\r\nAvailable modes are:\r\n-d: decompresses an input file to output file\r\n-c: compresses an input file to output file");
+		return;
+	}
+	unsigned int aa = 0xFF0000;
+	aa <<= 48;
+	printf("%i", aa);
+	fname = argv[2];
+	oname = argv[3];
+	if (mode == 0) {
+		FILE* f = fopen(fname, "rb");
+		fseek(f, 0x4, SEEK_SET);
+		unsigned int fileVer;
+		fread(&fileVer, 4, 1, f);
+		//fileVer = _byteswap_ulong(fileVer);
+		fseek(f, 0xC, SEEK_SET);
+		int decompSize;
+		fread(&decompSize, 4, 1, f);
+		decompSize = _byteswap_ulong(decompSize);
+		unsigned char* out = (unsigned char*)malloc(decompSize);
+		unsigned char* psuedoDecomp = (unsigned char*)malloc(1024 * 1024 * 2); // again, 2 megs because ??
+		file_t file;
+		fseek(f, 0, SEEK_END);
+		int fsize = ftell(f);
+		fseek(f, 0x10, SEEK_SET);
+		file.data = (char*)malloc(fsize - 0x10);
+		fread(file.data, fsize - 0x10, 1, f);
+		fclose(f);
+		file.remainingBits = 0;
+		file.prevData = 0;
+		file.remainingBytes = fsize - 0x10;
+		char* origdata = file.data;
+		if (fileVer == 2) {
+			DecompressFile(psuedoDecomp, &file, out, decompSize);
+		}
+		else if (fileVer == 1) {
+			DecompressFile1(&file, out, decompSize);
+		}
+		// write output file
+		f = fopen(oname, "wb");
+		fwrite(out, decompSize, 1, f);
+		// done, clean up
+		fclose(f);
+		free(origdata);
+		free(out);
+		free(psuedoDecomp);
+	}
+	else {
+		CompressFile(fname, oname);
+	}
 }
